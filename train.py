@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.utils.data
 import numpy as np
@@ -12,151 +13,174 @@ import torch.nn as nn
 from data import dataset
 from model import ConditionalUnet1D
 
-dataloader = torch.utils.data.DataLoader(
-    dataset,
-    batch_size=16,
-    num_workers=4,       
-    shuffle=True,
-    pin_memory=True,
-    persistent_workers=True
-)
+def get_args():
+    parser = argparse.ArgumentParser(description="Train Diffusion Policy")
+    parser.add_argument('--env', type=str, required=True, help='Environment name (e.g., CoinRun, Maze, PointMaze)')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-6, help='Weight decay for optimizer')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
+    parser.add_argument('--output_dir', type=str, default='./models', help='Directory to save models')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use for training')
+    args = parser.parse_args()
+    return args
 
-noise_scheduler = DDPMScheduler(
-    num_train_timesteps=1000,
-    beta_start=0.0001,
-    beta_end=0.02,
-    beta_schedule="linear"
-)
+def main():
+    args = get_args()
 
-num_epochs = 10
+    device = torch.device(args.device)
 
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,       
+        shuffle=True,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
-vision_feature_dim = 512
-image_feature_dim_reduced = 42
-action_dim = 15  
-lowdim_obs_dim = action_dim  
-obs_dim = vision_feature_dim + lowdim_obs_dim 
-global_cond_dim = image_feature_dim_reduced  
-diffusion_step_embed_dim = 256
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.0001,
+        beta_end=0.02,
+        beta_schedule="linear"
+    )
 
-print(f"Expected global_cond_dim: {global_cond_dim}")
+    vision_feature_dim = 512
+    image_feature_dim_reduced = 42
+    action_dim = 15  
+    lowdim_obs_dim = action_dim  
+    obs_dim = vision_feature_dim + lowdim_obs_dim 
+    global_cond_dim = image_feature_dim_reduced  
+    diffusion_step_embed_dim = 256
 
-def get_resnet(name: str, weights: Union[str, None]=None, **kwargs) -> nn.Module:
-    """
-    name: resnet18, resnet34, resnet50
-    weights: "IMAGENET1K_V1", None
-    """
-    func = getattr(torchvision.models, name)
-    if weights is not None:
-        resnet = func(weights=weights, **kwargs)
-    else:
-        resnet = func(pretrained=False, **kwargs)
-    resnet.fc = nn.Identity() 
-    return resnet
+    print(f"Expected global_cond_dim: {global_cond_dim}")
 
-def replace_bn_with_gn(root_module: nn.Module, features_per_group: int = 16) -> nn.Module:
-    """
-    Replace all BatchNorm2d layers with GroupNorm.
-    """
-    bn_module_names = [name for name, module in root_module.named_modules() if isinstance(module, nn.BatchNorm2d)]
+    def get_resnet(name: str, weights: str = None, **kwargs) -> nn.Module:
+        """
+        name: resnet18, resnet34, resnet50
+        weights: "IMAGENET1K_V1", None
+        """
+        func = getattr(torchvision.models, name)
+        if weights is not None:
+            resnet = func(weights=weights, **kwargs)
+        else:
+            resnet = func(pretrained=False, **kwargs)
+        resnet.fc = nn.Identity() 
+        return resnet
 
-    for name in bn_module_names:
-        parent_name, _, module_name = name.rpartition('.')
-        parent_module = root_module if parent_name == '' else root_module.get_submodule(parent_name)
+    def replace_bn_with_gn(root_module: nn.Module, features_per_group: int = 16) -> nn.Module:
+        """
+        Replace all BatchNorm2d layers with GroupNorm.
+        """
+        bn_module_names = [name for name, module in root_module.named_modules() if isinstance(module, nn.BatchNorm2d)]
 
-        bn_module = getattr(parent_module, module_name)
-        num_channels = bn_module.num_features
-        num_groups = max(1, num_channels // features_per_group)
+        for name in bn_module_names:
+            parent_name, _, module_name = name.rpartition('.')
+            parent_module = root_module if parent_name == '' else root_module.get_submodule(parent_name)
 
-        gn = nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
+            bn_module = getattr(parent_module, module_name)
+            num_channels = bn_module.num_features
+            num_groups = max(1, num_channels // features_per_group)
 
-        setattr(parent_module, module_name, gn)
+            gn = nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
 
-    return root_module
+            setattr(parent_module, module_name, gn)
 
-vision_encoder = get_resnet('resnet18')
-vision_encoder = replace_bn_with_gn(vision_encoder)
-vision_encoder = vision_encoder.to(device)
+        return root_module
 
-noise_pred_net = ConditionalUnet1D(
-    input_dim=action_dim,
-    global_cond_dim=global_cond_dim,
-    diffusion_step_embed_dim=diffusion_step_embed_dim 
-).to(device)
+    vision_encoder = get_resnet('resnet18')
+    vision_encoder = replace_bn_with_gn(vision_encoder)
+    vision_encoder = vision_encoder.to(device)
 
-cond_encoder = nn.Linear(vision_feature_dim, image_feature_dim_reduced).to(device)
+    noise_pred_net = ConditionalUnet1D(
+        input_dim=action_dim,
+        global_cond_dim=global_cond_dim,
+        diffusion_step_embed_dim=diffusion_step_embed_dim 
+    ).to(device)
 
-nets = nn.ModuleDict({
-    'vision_encoder': vision_encoder,
-    'noise_pred_net': noise_pred_net,
-    'cond_encoder': cond_encoder
-})
+    cond_encoder = nn.Linear(vision_feature_dim, image_feature_dim_reduced).to(device)
 
-ema = EMAModel(
-    parameters=nets.parameters(),
-    model=nets,
-    power=0.75
-)
+    nets = nn.ModuleDict({
+        'vision_encoder': vision_encoder,
+        'noise_pred_net': noise_pred_net,
+        'cond_encoder': cond_encoder
+    })
 
-optimizer = AdamW(
-    params=nets.parameters(),
-    lr=1e-4,
-    weight_decay=1e-6
-)
+    ema = EMAModel(
+        parameters=nets.parameters(),
+        model=nets,
+        power=0.75
+    )
 
-lr_scheduler = get_scheduler(
-    name='cosine',
-    optimizer=optimizer,
-    num_warmup_steps=500,
-    num_training_steps=len(dataloader) * num_epochs
-)
+    optimizer = AdamW(
+        params=nets.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
 
-# Training Loop
-with tqdm(range(num_epochs), desc='Epoch') as epoch_bar:
-    for epoch_idx in epoch_bar:
-        epoch_loss = []
-        for nbatch in dataloader:
-            images = nbatch['image'].to(device).float()  # Shape: (B, obs_horizon, C, H, W)
-            actions = nbatch['action'].to(device).float()  # Shape: (B, pred_horizon, 15)
+    lr_scheduler = get_scheduler(
+        name='cosine',
+        optimizer=optimizer,
+        num_warmup_steps=500,
+        num_training_steps=len(dataloader) * args.epochs
+    )
 
-            batch_size, obs_horizon, C, H, W = images.shape
-            images = images.view(batch_size * obs_horizon, C, H, W)  # (B*obs_horizon, C, H, W)
+    # Training Loop
+    with tqdm(range(args.epochs), desc='Epoch') as epoch_bar:
+        for epoch_idx in epoch_bar:
+            epoch_loss = []
+            for nbatch in dataloader:
+                images = nbatch['image'].to(device).float()  # Shape: (B, obs_horizon, C, H, W)
+                actions = nbatch['action'].to(device).float()  # Shape: (B, pred_horizon, 15)
 
-            with torch.no_grad(): 
-                image_features = nets['vision_encoder'](images)  # (B*obs_horizon, 512)
+                batch_size, obs_horizon, C, H, W = images.shape
+                images = images.view(batch_size * obs_horizon, C, H, W)  # (B*obs_horizon, C, H, W)
 
-            image_features = image_features.view(batch_size, obs_horizon, -1).mean(dim=1)  # (B, 512)
+                with torch.no_grad(): 
+                    image_features = nets['vision_encoder'](images)  # (B*obs_horizon, 512)
 
-            image_features_reduced = nets['cond_encoder'](image_features)  # (B, 42)
+                image_features = image_features.view(batch_size, obs_horizon, -1).mean(dim=1)  # (B, 512)
 
-            obs_cond = image_features_reduced  # (B, 42)
+                image_features_reduced = nets['cond_encoder'](image_features)  # (B, 42)
 
-            assert obs_cond.shape[-1] == global_cond_dim, f"Expected global_cond_dim={global_cond_dim}, got {obs_cond.shape[-1]}"
+                obs_cond = image_features_reduced  # (B, 42)
 
-            naction = actions
+                assert obs_cond.shape[-1] == global_cond_dim, f"Expected global_cond_dim={global_cond_dim}, got {obs_cond.shape[-1]}"
 
-            noise = torch.randn_like(naction).to(device) 
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()  # (B,)
+                naction = actions
 
-            noisy_actions = noise_scheduler.add_noise(naction, noise, timesteps) 
+                noise = torch.randn_like(naction).to(device) 
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()  # (B,)
 
-            noise_pred = nets['noise_pred_net'](noisy_actions, timesteps, global_cond=obs_cond) 
+                noisy_actions = noise_scheduler.add_noise(naction, noise, timesteps) 
 
-            noise_pred = torch.clamp(noise_pred, -1e3, 1e3)
-            noise = torch.clamp(noise, -1e3, 1e3)
+                noise_pred = nets['noise_pred_net'](noisy_actions, timesteps, global_cond=obs_cond) 
 
-            loss = nn.functional.mse_loss(noise_pred, noise)
+                noise_pred = torch.clamp(noise_pred, -1e3, 1e3)
+                noise = torch.clamp(noise, -1e3, 1e3)
 
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            lr_scheduler.step()
+                loss = nn.functional.mse_loss(noise_pred, noise)
 
-            ema.step(nets)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step()
 
-            epoch_loss.append(loss.item())
+                ema.step(nets)
 
-        avg_loss = np.mean(epoch_loss)
-        epoch_bar.set_postfix(loss=avg_loss)
-        epoch_bar.update(1)
-        print(f"Epoch {epoch_idx + 1}/{num_epochs} - Avg Loss: {avg_loss:.6f}")
+                epoch_loss.append(loss.item())
+
+            avg_loss = np.mean(epoch_loss)
+            epoch_bar.set_postfix(loss=avg_loss)
+            epoch_bar.update(1)
+            print(f"Epoch {epoch_idx + 1}/{args.epochs} - Avg Loss: {avg_loss:.6f}")
+
+            # Save model checkpoint
+            checkpoint_path = f"{args.output_dir}/diffusion_policy_epoch_{epoch_idx + 1}.pt"
+            torch.save(nets.state_dict(), checkpoint_path)
+            print(f"Saved checkpoint: {checkpoint_path}")
+
+if __name__ == "__main__":
+    main()
