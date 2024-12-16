@@ -1,12 +1,14 @@
+import argparse
 import zarr
 import torch
 import torch.utils.data
 import numpy as np
+import os
 
 def create_sample_indices(episode_ends, sequence_length, pad_before=0, pad_after=0):
     indices = []
     for i, end in enumerate(episode_ends):
-        start = 0 if i == 0 else episode_ends[i-1]
+        start = 0 if i == 0 else episode_ends[i - 1]
         episode_length = end - start
         for idx in range(-pad_before, episode_length - sequence_length + pad_after + 1):
             buffer_start = max(start + idx, start)
@@ -31,25 +33,12 @@ def sample_sequence(train_data, sequence_length, buffer_start_idx, buffer_end_id
                 sample = sample[:expected_length]
             else:
                 padding = expected_length - actual_length
-                if input_arr.ndim == 4:
-                    pad_before = sample[0].reshape(1, -1, 1, 1).repeat(padding, axis=0)
-                elif input_arr.ndim == 2:
-                    pad_before = sample[0].reshape(1, -1).repeat(padding, axis=0)
+                pad_shape = [padding] + list(sample.shape[1:])
+                pad_before = np.tile(sample[0:1], (padding,) + (1,) * (sample.ndim - 1))
                 sample = np.concatenate([pad_before, sample], axis=0)
 
         if sample_start_idx > 0 or sample_end_idx < sequence_length:
-            if input_arr.ndim == 4:
-                padded = np.zeros((sequence_length,) + input_arr.shape[1:], dtype=input_arr.dtype)
-                if sample_start_idx > 0:
-                    padded[:sample_start_idx] = sample[0]
-                if sample_end_idx < sequence_length:
-                    padded[sample_end_idx:] = sample[-1]
-            elif input_arr.ndim == 2:
-                padded = np.zeros((sequence_length,) + input_arr.shape[1:], dtype=input_arr.dtype)
-                if sample_start_idx > 0:
-                    padded[:sample_start_idx] = sample[0]
-                if sample_end_idx < sequence_length:
-                    padded[sample_end_idx:] = sample[-1]
+            padded = np.zeros((sequence_length,) + sample.shape[1:], dtype=sample.dtype)
             padded[sample_start_idx:sample_end_idx] = sample
             result[key] = padded
         else:
@@ -64,10 +53,10 @@ def get_data_stats(data):
             'max': np.max(data, axis=(0, 2, 3))   # Shape: (C,)
         }
     elif data.ndim == 2:
-        # For action data: (N, 15)
+        # For action data: (N, action_dim)
         stats = {
-            'min': np.min(data, axis=0),  # Shape: (15,)
-            'max': np.max(data, axis=0)   # Shape: (15,)
+            'min': np.min(data, axis=0),
+            'max': np.max(data, axis=0)
         }
     else:
         raise ValueError(f"Unsupported data shape: {data.shape}")
@@ -75,34 +64,21 @@ def get_data_stats(data):
 
 def normalize_data(data, stats):
     scale = stats['max'] - stats['min']
-    scale[scale == 0] = 1 
-    if data.ndim == 4:
-        scale = scale.reshape(-1, 1, 1)
-        min_vals = stats['min'].reshape(-1, 1, 1)
-    elif data.ndim == 2:
-        scale = scale.reshape(1, -1)
-        min_vals = stats['min'].reshape(1, -1)
-    ndata = (data - min_vals) / scale
-    ndata = ndata * 2 - 1 
-    return ndata
+    scale[scale == 0] = 1
+    normalized_data = (data - stats['min']) / scale * 2 - 1
+    return normalized_data
 
-def unnormalize_data(ndata, stats):
+def unnormalize_data(normalized_data, stats):
     scale = stats['max'] - stats['min']
-    scale[scale == 0] = 1 
-    if ndata.ndim == 4:
-        scale = scale.reshape(-1, 1, 1)
-        min_vals = stats['min'].reshape(-1, 1, 1)
-    elif ndata.ndim == 2:
-        scale = scale.reshape(1, -1)
-        min_vals = stats['min'].reshape(1, -1)
-    data = (ndata + 1) / 2 * scale + min_vals
+    scale[scale == 0] = 1
+    data = (normalized_data + 1) / 2 * scale + stats['min']
     return data
 
 class MazeImageDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path, pred_horizon, obs_horizon, action_horizon):
         dataset_root = zarr.open(dataset_path, 'r')
         train_image_data = dataset_root['images'][:]
-        train_image_data = np.moveaxis(train_image_data, -1, 1) 
+        train_image_data = np.moveaxis(train_image_data, -1, 1)  # (N, H, W, C) -> (N, C, H, W)
 
         actions = dataset_root['actions'][:]
         episode_ends = dataset_root['meta']['episode_ends'][:]
@@ -131,15 +107,15 @@ class MazeImageDataset(torch.utils.data.Dataset):
         self.stats = stats
         self.normalized_train_data = normalized_train_data
         self.pred_horizon = pred_horizon
-        self.action_horizon = action_horizon
         self.obs_horizon = obs_horizon
+        self.action_horizon = action_horizon
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
         buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = self.indices[idx]
-        nsample = sample_sequence(
+        sample = sample_sequence(
             train_data=self.normalized_train_data,
             sequence_length=self.pred_horizon,
             buffer_start_idx=buffer_start_idx,
@@ -148,10 +124,9 @@ class MazeImageDataset(torch.utils.data.Dataset):
             sample_end_idx=sample_end_idx
         )
 
-        nsample['image'] = nsample['image'][:self.obs_horizon, :]
-        nsample['action'] = nsample['action'][:self.pred_horizon, :]
-
-        return nsample
+        sample['image'] = sample['image'][:self.obs_horizon, :]
+        sample['action'] = sample['action'][:self.pred_horizon, :]
+        return sample
 
 def test_dataset(dataset):
     try:
@@ -171,8 +146,8 @@ def test_dataset(dataset):
         action_stats = dataset.stats['action']
         original_action = unnormalize_data(action, action_stats)
 
-        assert np.all(original_action >= action_stats['min'].reshape(1, -1) - 1e-5), "Action data below min after unnormalization."
-        assert np.all(original_action <= action_stats['max'].reshape(1, -1) + 1e-5), "Action data above max after unnormalization."
+        assert np.all(original_action >= action_stats['min'] - 1e-5), "Action data below min after unnormalization."
+        assert np.all(original_action <= action_stats['max'] + 1e-5), "Action data above max after unnormalization."
         print("Action normalization and unnormalization successful.")
 
     except AssertionError as e:
@@ -180,11 +155,29 @@ def test_dataset(dataset):
     except Exception as e:
         print(f"Error: {e}")
 
-dataset = MazeImageDataset(
-    dataset_path='maze.zarr',
-    pred_horizon=16,
-    obs_horizon=16,
-    action_horizon=1
-)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Data Collection for MazeImageDataset")
+    parser.add_argument('--dataset_path', type=str, default='maze.zarr', help='Path to the dataset')
+    parser.add_argument('--pred_horizon', type=int, default=16, help='Prediction horizon')
+    parser.add_argument('--obs_horizon', type=int, default=16, help='Observation horizon')
+    parser.add_argument('--action_horizon', type=int, default=1, help='Action horizon')
+    parser.add_argument('--test', action='store_true', help='Run dataset testing')
+    return parser.parse_args()
 
-test_dataset(dataset)
+def main():
+    args = parse_args()
+
+    dataset = MazeImageDataset(
+        dataset_path=args.dataset_path,
+        pred_horizon=args.pred_horizon,
+        obs_horizon=args.obs_horizon,
+        action_horizon=args.action_horizon
+    )
+
+    if args.test:
+        test_dataset(dataset)
+    else:
+        print(f"Dataset created with {len(dataset)} samples.")
+
+if __name__ == "__main__":
+    main()
